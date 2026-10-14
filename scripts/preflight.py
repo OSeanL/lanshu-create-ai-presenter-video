@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import subprocess
@@ -30,13 +31,21 @@ def probe(path: Path) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
-def require_file(value: str, label: str, errors: list[str]) -> Path | None:
+def portable_name(value: str) -> str:
+    """Show job-relative paths as written and absolute paths by file name only."""
+    path = Path(value).expanduser()
+    return path.name if path.is_absolute() else path.as_posix()
+
+
+def require_file(
+    value: str, label: str, job_dir: Path, errors: list[str]
+) -> Path | None:
     if not value:
         errors.append(f"missing {label}")
         return None
-    path = Path(value).expanduser().resolve()
+    path = (job_dir / Path(value).expanduser()).resolve()
     if not path.is_file():
-        errors.append(f"{label} is not a file: {path}")
+        errors.append(f"{label} is not a file: {portable_name(value)}")
         return None
     return path
 
@@ -48,14 +57,14 @@ def write_atomic(path: Path, text: str) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: preflight.py ~/Videos/my-presenter-video/job.json", file=sys.stderr)
-        return 64
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("job", help="Path to job.json, e.g. ~/Videos/my-presenter-video/job.json")
+    args = parser.parse_args()
     if not shutil.which("ffprobe"):
         print("ERROR: ffprobe is required", file=sys.stderr)
         return 2
 
-    job_path = Path(sys.argv[1]).expanduser().resolve()
+    job_path = Path(args.job).expanduser().resolve()
     if not job_path.is_file():
         print(f"ERROR: job manifest does not exist: {job_path}", file=sys.stderr)
         return 2
@@ -72,9 +81,26 @@ def main() -> int:
     if not topic and not script_text:
         errors.append("topic or script_path is required")
     if script_text:
-        require_file(script_text, "script", errors)
+        require_file(script_text, "script", job_dir, errors)
 
-    image = require_file(str(input_data.get("presenter_image", "")), "presenter image", errors)
+    creative = job.get("creative", {})
+    route = str(creative.get("route") or "presenter")
+    if route not in ("presenter", "styled"):
+        errors.append(f"creative.route must be presenter or styled, not {route!r}")
+    has_presenter = route != "styled"
+    if route == "styled":
+        style = str(creative.get("explainer_style") or "")
+        kits = Path(__file__).resolve().parent.parent / "explainer" / "kits"
+        if not style or not (kits / style / "starter").is_dir():
+            errors.append(f"creative.explainer_style must name a style in explainer/kits, not {style!r}")
+        if (int(creative.get("width") or 0), int(creative.get("height") or 0)) != (1920, 1080):
+            errors.append("the styled route renders 1920x1080 (16:9)")
+
+    image = (
+        require_file(str(input_data.get("presenter_image", "")), "presenter image", job_dir, errors)
+        if has_presenter
+        else None
+    )
     if image:
         try:
             media["presenter_image"] = probe(image)
@@ -90,12 +116,12 @@ def main() -> int:
                 height = int(streams[0].get("height") or 0)
                 if min(width, height) < 512:
                     warnings.append(f"presenter image is low resolution: {width}x{height}")
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-            errors.append(f"could not decode presenter image: {exc}")
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            errors.append(f"could not decode presenter image: {image.name}")
 
     voice_value = str(input_data.get("voice_sample", "")).strip()
     if voice_value:
-        voice = require_file(voice_value, "voice sample", errors)
+        voice = require_file(voice_value, "voice sample", job_dir, errors)
         if voice:
             try:
                 media["voice_sample"] = probe(voice)
@@ -111,8 +137,8 @@ def main() -> int:
                     warnings.append(f"voice sample is short: {duration:.3f}s")
                 if duration > 60:
                     warnings.append(f"voice sample is unusually long: {duration:.3f}s")
-            except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError) as exc:
-                errors.append(f"could not decode voice sample: {exc}")
+            except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+                errors.append(f"could not decode voice sample: {voice.name}")
         if not input_data.get("voice_clone_approved"):
             remote_blockers.append("voice_clone_approved must be true before voice cloning")
     else:
@@ -120,31 +146,36 @@ def main() -> int:
 
     supporting_reports = []
     for value in input_data.get("supporting_media", []):
-        path = require_file(str(value), "supporting media", errors)
+        path = require_file(str(value), "supporting media", job_dir, errors)
         if path:
             try:
                 supporting_reports.append({"file": path.name, "probe": probe(path)})
-            except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-                errors.append(f"could not decode supporting media {path}: {exc}")
+            except (subprocess.CalledProcessError, json.JSONDecodeError):
+                errors.append(f"could not decode supporting media: {path.name}")
     media["supporting_media"] = supporting_reports
 
-    if not input_data.get("rights_confirmed"):
+    if has_presenter and not input_data.get("rights_confirmed"):
         remote_blockers.append("rights_confirmed must be true before presenter synthesis")
-    if not input_data.get("adult_presenter_confirmed"):
+    if has_presenter and not input_data.get("adult_presenter_confirmed"):
         remote_blockers.append("adult_presenter_confirmed must be true before presenter synthesis")
     if not input_data.get("remote_upload_approved"):
-        remote_blockers.append("remote_upload_approved must be true before remote generation")
+        remote_blockers.append(
+            "remote_upload_approved must be true before remote generation"
+            if has_presenter
+            else "remote_upload_approved must be true before the script text is sent to a TTS provider "
+            "(not needed when the user supplies the narration and story.py --audio is used)"
+        )
+
 
     manual = job.get("manual_input_review", {})
     for key in ("image_viewed", "single_clear_face", "image_has_no_unwanted_text"):
-        if not manual.get(key):
+        if has_presenter and not manual.get(key):
             errors.append(f"manual_input_review.{key} must be true")
     if voice_value:
         for key in ("voice_sample_listened", "single_clear_speaker"):
             if not manual.get(key):
                 errors.append(f"manual_input_review.{key} must be true")
 
-    creative = job.get("creative", {})
     duration = float(creative.get("duration_target_s") or 0)
     if not 5 <= duration <= 1800:
         errors.append("creative.duration_target_s must be between 5 and 1800")
